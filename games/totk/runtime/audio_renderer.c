@@ -266,9 +266,10 @@ static void *render_thread(void *p) {
                         (unsigned long long)r->stop_released, (unsigned long long)r->empty_played, (unsigned long long)r->flushed);
             }
         }
+        double pace = r->state == 0 ? audio_mixer_pace(r) : 1.0;   /* output clock drift (audio_mixer_pace) */
         pthread_mutex_unlock(&r->lock);
         runtime_event_signal(r->event);
-        uint64_t ns = (uint64_t)(frame * 1e9);
+        uint64_t ns = (uint64_t)(frame * pace * 1e9);
         next.tv_nsec += (long)ns; while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         int64_t wait = (int64_t)(next.tv_sec - now.tv_sec) * 1000000000LL + (next.tv_nsec - now.tv_nsec);

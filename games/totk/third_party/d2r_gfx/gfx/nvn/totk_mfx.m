@@ -57,9 +57,12 @@ static struct {
  * allocations on the tested Mac, even after the old Objective-C object dies.
  * Keep a bounded set of exact configurations without eviction/rebuild churn.
  * In-flight frames retain their own resource payload independently of the
- * cache. Once full, new configurations use the previous uncached path. This does not establish or
- * fix every source of long-session memory growth. Diagnostic opt-out below. */
-#define MFX_FI_CACHE 4
+ * cache. This does not establish or fix every source of long-session memory growth. Diagnostic opt-out below.
+ * 2026-11-25: 4 -> 16. An uncached configuration is rebuilt on every switch to it and, as above, each rebuild keeps
+ * its device memory, so keeping the interpolator costs once what rebuilding costs every time; window sizes that are
+ * not one of the two canvases (a zoomed window: 1808x1017) filled 4 entries quickly. Past 16 the uncached path stays,
+ * with one red line saying so. */
+#define MFX_FI_CACHE 16
 static id<MTL4FXFrameInterpolator> g_fi_cache[MFX_FI_CACHE];
 static unsigned g_fi_cache_count;
 static int fi_cache_on(void) {
@@ -173,6 +176,7 @@ static void ensure_fi(NSUInteger iw, NSUInteger ih) {
         g.fi = [d newFrameInterpolatorWithDevice:g.dev compiler:comp];
         if (!g.fi) MDIE("frame interpolator %lux%lu -> %lux%lu not created", (unsigned long)iw, (unsigned long)ih, (unsigned long)g.out_w, (unsigned long)g.out_h);
         if (fi_cache_on() && g_fi_cache_count < MFX_FI_CACHE) g_fi_cache[g_fi_cache_count++] = g.fi;
+        else if (fi_cache_on()) { static int warned; if (!warned++) MLOG("【红】MetalFX interpolator cache full (%d configurations): %lux%lu -> %lux%lu is rebuilt on every switch to it, and each rebuild keeps its device memory", MFX_FI_CACHE, (unsigned long)iw, (unsigned long)ih, (unsigned long)g.out_w, (unsigned long)g.out_h); }
     }
     drop(&g.mv); g.mv = mk(MTLPixelFormatRG16Float, iw, ih, MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead);
     if (!g.mv_ps) {

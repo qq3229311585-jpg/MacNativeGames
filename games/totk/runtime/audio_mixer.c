@@ -41,6 +41,7 @@ typedef struct Mixer {
     _Atomic int playing; int ready; _Atomic uint64_t missing_frames, trims, trimmed_frames;
     _Atomic uint64_t flush_until; _Atomic unsigned stop_epoch; unsigned callback_epoch;
     _Atomic uint64_t callback_frames,callback_nonzero;
+    double pace_level, pace;                       /* render thread only: smoothed ring level after a push, last period factor (audio_mixer_pace) */
     EffectState *effect; int *effect_order; unsigned effect_reported;
     uint64_t *sink_address; uint32_t *sink_size, *sink_offset, *sink_old, *sink_written;
     unsigned reported;                             /* one-time reports */
@@ -724,12 +725,36 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
       for (int k = 0; k < 2 * frames; k++) { double x = lr[k];m->level_sum+=x*x;if(fabs(x)>m->level_peak)m->level_peak=fabs(x); }
       m->level_count+=2*(uint64_t)frames;m->level_frames+=(uint64_t)frames;
       if (m->level_frames >= (uint64_t)r->param.sample_rate * 5) {
-          fprintf(stderr, "[totk-audio] output level: rms %.4f peak %.4f over %.1f s, underruns %llu, overruns %llu, missing frames %llu, backlog trims %llu (%llu frames), callback frames %llu / nonzero %llu\n", sqrt(m->level_sum/(double)m->level_count),m->level_peak,
-                  m->level_frames/(double)r->param.sample_rate,(unsigned long long)atomic_load(&m->underruns),(unsigned long long)atomic_load(&m->overruns),(unsigned long long)atomic_load(&m->missing_frames),(unsigned long long)atomic_load(&m->trims),(unsigned long long)atomic_load(&m->trimmed_frames),(unsigned long long)atomic_load(&m->callback_frames),(unsigned long long)atomic_load(&m->callback_nonzero));
+          fprintf(stderr, "[totk-audio] output level: rms %.4f peak %.4f over %.1f s, underruns %llu, overruns %llu, missing frames %llu, backlog trims %llu (%llu frames), callback frames %llu / nonzero %llu, pace %+.0f ppm\n", sqrt(m->level_sum/(double)m->level_count),m->level_peak,
+                  m->level_frames/(double)r->param.sample_rate,(unsigned long long)atomic_load(&m->underruns),(unsigned long long)atomic_load(&m->overruns),(unsigned long long)atomic_load(&m->missing_frames),(unsigned long long)atomic_load(&m->trims),(unsigned long long)atomic_load(&m->trimmed_frames),(unsigned long long)atomic_load(&m->callback_frames),(unsigned long long)atomic_load(&m->callback_nonzero),m->pace?(1.0/m->pace-1.0)*1e6:0.0);
           m->level_sum=m->level_peak=0;m->level_count=m->level_frames=0;
       } }
     capture_copy(m,lr,frames);
     output_push(m, lr, frames);
+}
+
+/* Clock drift (2026-11-25): the render thread makes a frame every sample_count / sample_rate seconds of CLOCK_MONOTONIC,
+   while CoreAudio takes them at the output device's own clock. The two differ by tens of ppm, and nothing corrected a
+   device that runs faster: the 20 ms prefill drained a few frames a second until a callback found less than a device
+   buffer, which counted an underrun, played silence and prefilled again, every few minutes (v1.4.3 final soak: 5 -> 14
+   in 30 minutes; a backlog from a slower device is already trimmed in pull()). Called by the render thread after each
+   frame: the factor for its next period, from the ring level smoothed over a few seconds against the prefill, at most
+   +-0.1% (inaudible; the game's audio events move by the same amount). 1 while nothing plays or the output waits for
+   its prefill. The level line prints it as "pace": how much faster than the host clock the device was being fed.
+   TOTK_AUDIO_PACE=0 turns it off. */
+double audio_mixer_pace(AudioRenderer *r) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_AUDIO_PACE"); on = !e || atoi(e); }
+    Mixer *m = r->mixer;
+    if (!m) return 1.0;
+    uint64_t wr = atomic_load(&m->wr), rd = atomic_load_explicit(&m->rd, memory_order_acquire);
+    double target = (double)m->frame * (double)prefill_blocks();
+    if (!on || !m->unit_ok || !atomic_load_explicit(&m->playing, memory_order_acquire) || !m->ready || wr < rd || target <= 0) { m->pace_level = target; m->pace = 1.0; return 1.0; }
+    m->pace_level += ((double)(wr - rd) - m->pace_level) * 0.002;   /* ~500 frames, 2.5 s: averages over the device's buffer-sized pulls */
+    double f = 1.0 + 0.001 * (m->pace_level - target) / target;      /* below the prefill: a shorter period (feed faster) */
+    if (f < 0.999) f = 0.999;
+    if (f > 1.001) f = 1.001;
+    m->pace = f;
+    return f;
 }
 
 /* Probe hook: the latest mixed stereo frames. */

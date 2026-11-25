@@ -346,6 +346,27 @@ static void defer_obj_release_ex(id obj, int keep_resident) {
 }
 static void defer_obj_release(id obj) { defer_obj_release_ex(obj, 0); }
 static void defer_obj_unref(id obj) { defer_obj_release_ex(obj, 1); }
+// TOTK: auxiliary textures for rendering into block-compressed formats (blk_aux, below)
+static NSMutableDictionary<NSNumber *, id<MTLTexture>> *g_blkaux;   // submit thread only
+/* 2026-11-25: the auxiliary texture of a serial used to stay in g_blkaux (and the residency set) for ever: nothing removed it
+   when the game finalised the texture, and a resize replaced it without retiring the old one. TOTK finalises temporary
+   texture objects every frame, so each such serial leaked its block texture. Finalised serials are now queued
+   (mtl_tex_release, any thread) and their auxiliary textures retired at the end of the submission (blkaux_flush), like
+   dead_put_flush; a dead serial a later replay brings back is queued again when its texture is made. */
+static pthread_mutex_t g_blkaux_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t *g_blkaux_gone; static int g_blkaux_ngone, g_blkaux_cgone; static _Atomic int g_blkaux_any; static uint64_t g_blkaux_made, g_blkaux_freed;
+static void blkaux_gone_note(uint64_t k) {
+    if (!atomic_load_explicit(&g_blkaux_any, memory_order_relaxed)) return;   // no auxiliary texture made yet: nothing to retire
+    pthread_mutex_lock(&g_blkaux_mu);
+    if (g_blkaux_ngone == g_blkaux_cgone) { g_blkaux_cgone = g_blkaux_cgone ? g_blkaux_cgone * 2 : 256; g_blkaux_gone = realloc(g_blkaux_gone, (size_t)g_blkaux_cgone * sizeof *g_blkaux_gone); if (!g_blkaux_gone) MDIE("block texture retire list"); }
+    g_blkaux_gone[g_blkaux_ngone++] = k;
+    pthread_mutex_unlock(&g_blkaux_mu);
+}
+static void blkaux_flush(void) {   // submit thread, submission end: released once this submission completes
+    pthread_mutex_lock(&g_blkaux_mu); int n = g_blkaux_ngone; uint64_t *l = n ? malloc((size_t)n * sizeof *l) : NULL; if (n) memcpy(l, g_blkaux_gone, (size_t)n * sizeof *l); g_blkaux_ngone = 0; pthread_mutex_unlock(&g_blkaux_mu);
+    for (int i = 0; i < n && g_blkaux; i++) { NSNumber *key = @(l[i]); id<MTLTexture> a = g_blkaux[key]; if (a) { defer_obj_release(a); [g_blkaux removeObjectForKey:key]; g_blkaux_freed++; } }
+    free(l);
+}
 static void defer_drain(void) { @autoreleasepool {   // also called from GPU completion handlers
     NSMutableArray<NvDeferredRelease *> *ready = [NSMutableArray array];
     pthread_mutex_lock(&g_deferred_mu);
@@ -1997,6 +2018,7 @@ uint64_t mtl_sub_commit(void) {
     q4_commit(g_cb, o);
     if (nogpu()) g_ev.signaledValue = fence; else [g_q4 signalEvent:g_ev value:fence];
     dead_put_flush();   // textures created for finalized serials: released once this submission completes
+    blkaux_flush();   // auxiliary block textures of finalized serials, likewise
     stor_sweep(fence);   // TOTK: storage-shared textures nobody held for a while
     treg_sweep_replaced();   // descriptor caches must not retain replaced CPU-uploaded storage indefinitely
     type_views_sweep_retired();
@@ -3602,6 +3624,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
       MLOG("[pool-query-cache] enabled=%d hits=%llu misses=%llu checked=%llu",pool_query_on(),(unsigned long long)hits,(unsigned long long)misses,(unsigned long long)checked); }
     MLOG("[shadow-index] enabled=%d hit=%llu miss=%llu verified=%llu",shadow_index_on(),(unsigned long long)g_shadow_index_hits,(unsigned long long)g_shadow_index_misses,(unsigned long long)g_shadow_index_verified);
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
+    MLOG("压缩格式渲染辅助贴图：建 %llu 张，回收 %llu 张（随贴图销毁或换尺寸），现存约 %llu 张", (unsigned long long)g_blkaux_made, (unsigned long long)g_blkaux_freed, (unsigned long long)(g_blkaux_made - g_blkaux_freed));
     MLOG("贴图类型缓存已回收退役视图 %llu 个", (unsigned long long)g_type_retired_views);
     res_site_report(8);
 }
@@ -3612,6 +3635,7 @@ void mtl_tex_release(tex_t *t) {
     BOTW_SERIAL_NOTE(t->serial, "nvnTextureFinalize") BOTW_TEX_RELEASE_KEEP(t->serial) serial_del(t->serial);
     pthread_mutex_lock(&g_smu); totk_serial_add(&g_dead_serial, t->serial); ser_bump_locked(t->serial); pthread_mutex_unlock(&g_smu);   // view caches of this serial look again (dead-serial follow)
     treg_drop_serial(t->serial);
+    blkaux_gone_note(t->serial);   // its auxiliary block texture, if it rendered into a compressed format
     serial_forget_if_unreferenced(t->serial);   // nothing names it any more: no need to remember it
 }
 /* TOTK (2026-10-17): not yet. A finalized serial must stay remembered while a texture-pool slot still names it: tex_by_id
@@ -4068,7 +4092,6 @@ static int pf_block_compressed(NSUInteger pf) { return pf >= 130 && pf <= 222 &&
 // into an auxiliary texture of the view format sized in blocks; the blocks are copied to the compressed texture
 // through a buffer when the pass ends (and copied back first when the pass loads the old contents).
 int nvn_fmt_bpb(int format, int *bw, int *bh);
-static NSMutableDictionary<NSNumber *, id<MTLTexture>> *g_blkaux;
 typedef struct { __unsafe_unretained id<MTLTexture> aux, dst; NSUInteger level, slice, plane, lw, lh, bx, by, bpb; int decode, fmt; } blk_wb;   // plane: 3D depth plane
 static blk_wb g_blk_wb[8]; static int g_nblk_wb;
 /* GPUs without BC (A15/A16): the compressed texture exists only decompressed (bc_unpack), so the rendered blocks are
@@ -4161,9 +4184,11 @@ static id<MTLTexture> blk_aux(const tex_t *t, const view_t *v, int has_v, blk_wb
         d.textureType = base.textureType; d.pixelFormat = (MTLPixelFormat)vpf; d.width = aw; d.height = ah;
         d.arrayLength = base.arrayLength; d.depth = base.depth; d.mipmapLevelCount = base.mipmapLevelCount;
         d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        if (a) { defer_obj_release(a); g_blkaux_freed++; }   // resized: the old one may still be read by a submission in flight
         a = [g_dev newTextureWithDescriptor:d];
         if (!a) MDIE("auxiliary block render texture %lux%lu", (unsigned long)aw, (unsigned long)ah);
-        res_add(a); g_blkaux[key] = a;
+        res_add(a); g_blkaux[key] = a; g_blkaux_made++; atomic_store_explicit(&g_blkaux_any, 1, memory_order_relaxed);
+        if (serial_is_dead(t->serial)) blkaux_gone_note(t->serial);   // finalised before this replay: goes with this submission
         static int once; if (!once++) MLOG("[totk] rendering into compressed texture format %#x through view format %#x via a %lux%lu block texture", t->d.format, v->format, (unsigned long)aw, (unsigned long)ah);
     }
     NSUInteger lv = v->set_levels ? v->base_level : 0, sl = v->set_layers ? v->min_layer : 0;
