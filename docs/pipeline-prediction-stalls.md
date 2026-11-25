@@ -37,9 +37,15 @@ planes a pass attaches is decided only when it begins, `ds_scan`); wrong guesses
 
 ## Still done on the submission thread
 
-- `pso_desc` for each guess: a vertex function patched for varyings the fragment reads but the vertex shader does
-  not write, or for a layered pass (`vs_fn_for`), and the depth-less fragment function of a pass without a depth
-  buffer (`fs_fn_without_depth`), compile their libraries there.
+- ~~`pso_desc` for each guess~~ (2026-11-25): a plain guess's descriptor is now made on the background worker
+  (`pso_desc_off_thread`), so the vertex function patched for varyings the fragment reads but the vertex shader does
+  not write (`vs_fn_for`) and the depth-less fragment function of a pass without a depth buffer
+  (`fs_fn_without_depth`) compile their libraries there, not on the submission thread. Each is made under its own
+  lock and cached on the shader, as before; a draw that needs the same function waits on that lock, as it would have
+  waited for the compile anyway. A key whose descriptor reads replay state stays on the submission thread: emulated
+  vertex border colours (`PSO_VBORDER`: `border_key` reads the bound samplers in `S`), a layered pass, a MetalFX role
+  or a merged pass (prediction does not make these keys today). The statistics line counts these guesses
+  (`描述符在后台做 …`). Not measured in game yet.
 - `ds_scan` at the start of each pass calls `prog_ps_writes_depth` → `prog_get`, which can translate and compile a
   program of that pass. This is the path the pass needs anyway.
 - A new program at its first draw: translation, library compile and, because it could not be guessed, its
@@ -50,10 +56,11 @@ planes a pass attaches is decided only when it begins, `ds_scan`); wrong guesses
 `scripts/verify_gfx.py` (`make probe-gfx`, no GPU drawing): prediction leaves the active scissor, conditional
 counters and bindings untouched; an unresolved future program is skipped without translation or compilation; a
 cached alternate variant is used without being selected; a missing variant is skipped; a program with an
-untranslated stage is skipped; a depth-exporting fragment gets no depth-less guess; old completed slots are freed,
-recent ones and unfinished ones are kept. `TOTK_PROBE_NEGATIVE=24` (take the active variant whatever the state),
-`25` (free every slot), `26` (ignore untranslated stages) and `27` (guess depth-less pipelines for depth export)
-each make the probe fail at its own check.
+untranslated stage is skipped; a depth-exporting fragment gets no depth-less guess; a plain guess's descriptor is made
+on the worker and one that reads replay state is not; old completed slots are freed, recent ones and unfinished ones
+are kept. `TOTK_PROBE_NEGATIVE=24` (take the active variant whatever the state), `25` (free every slot), `26` (ignore
+untranslated stages), `27` (guess depth-less pipelines for depth export) and `28` (make every guess's descriptor on the
+submission thread) each make the probe fail at its own check.
 
 ## In-game comparison (1.2.1, Apple M4, 2026-10-19)
 

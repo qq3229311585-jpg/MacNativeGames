@@ -6240,6 +6240,7 @@ static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_
 static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // 本次提交是否已预测过（按提交序号）；累计丢出 / 领用条数 | Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
 // Statistics line (pso_predict_rest, every 100 scans): guesses refused because the table was full, stale guesses freed,
 // time draws waited for a background compile, scans and which budget ended them.
+static uint64_t g_pp_desc_off;   // guesses whose descriptor (and the libraries it needs) was made on the worker
 static uint64_t g_pp_full, g_pp_reclaimed, g_pp_waits, g_pp_wait_ns, g_pp_scans, g_pp_scan_ns, g_pp_stop[3];
 static void pso_predict_rest(void);
 static int pso_pend_find(const pso_key *k) { for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !memcmp(&g_pp[i].k, k, sizeof *k)) return i; return -1; }
@@ -6249,6 +6250,15 @@ static void pso_pend_reclaim(uint64_t submit) {
     for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && ((g_pp[i].done && submit - g_pp[i].submit > 2) || pred_negative() == 25)) {
         g_pp[i].ps = nil; g_pp[i].used = 0; g_pp_reclaimed++;
     }
+}
+/* Whether pso_pend_kick may make a guess's descriptor on the worker. pso_desc reads no replay state (S, R, g_pass) for a
+   key without a layered pass, emulated vertex border colours or a MetalFX role: what it derives then (vs_fn_for's varying
+   patch, fs_fn_without_depth, fs_fn_mfx) is built under each function's own lock and cached on the shader. A key with
+   PSO_VBORDER needs border_key, which reads the bound samplers in S, so it stays on the submission thread; so do the
+   other two, which pso_key_fill never sets for a guess today. Negative 28 keeps every descriptor on the submission thread. */
+static int pso_desc_off_thread(const pso_key *k) {
+    if (pred_negative() == 28) return 0;
+    return !(k->a2c & (PSO_LAYERED | PSO_VBORDER)) && !((k->a2c >> 2) & 3) && !k->fsfn;
 }
 static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // 提交线程调：没在缓存、没在表里才丢 | Called by the submit thread: kick only if it is neither in the cache nor in the table
     if (hm_get_id(&g_pso, k)) return;
@@ -6260,9 +6270,16 @@ static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // �
     if (at < 0 && slot < 0) g_pp_full++;
     pthread_mutex_unlock(&g_pp_mu);
     if (at >= 0 || slot < 0) return;
-    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++;
+    g_pp_kicked++;
+    // The descriptor of a plain guess is made on the worker: its vertex function patched for unwritten varyings
+    // (vs_fn_for) and its depth-less fragment function (fs_fn_without_depth) are library compiles, each tens of ms,
+    // that used to run here, on the submission thread, before the draw it was predicting for even began.
+    MTLRenderPipelineDescriptor *d = pso_desc_off_thread(k) ? nil : pso_desc(k, vs, fs, nil, 0);
+    if (!d) g_pp_desc_off++;
+    pso_key kk = *k; NvShader *bvs = vs, *bfs = fs;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+        MTLRenderPipelineDescriptor *dd = d ? d : pso_desc(&kk, bvs, bfs, nil, 0);
+        NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:dd error:&e];
         pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
     });
 }
@@ -7714,10 +7731,10 @@ static void pso_predict_rest(void) {
     if (g_pp_scans % 100 == 0) {
         pthread_mutex_lock(&g_pp_mu); uint64_t full = g_pp_full, freed = g_pp_reclaimed, waits = g_pp_waits, wait_ns = g_pp_wait_ns; int busy = 0;
         for (int i = 0; i < PSO_PEND_MAX; i++) busy += g_pp[i].used; pthread_mutex_unlock(&g_pp_mu);
-        MLOG("并行预编 至提交 %llu：扫描 %llu 次（平均 %.2f ms；到上限：命令 %llu、键 %llu、时间 %llu），后台开编 %llu 条，绘制领用 %llu 条（等后台 %llu 次共 %.1f ms），表满没收 %llu 条，回收没用上的 %llu 条，表里现有 %d 条",
+        MLOG("并行预编 至提交 %llu：扫描 %llu 次（平均 %.2f ms；到上限：命令 %llu、键 %llu、时间 %llu），后台开编 %llu 条（描述符在后台做 %llu 条），绘制领用 %llu 条（等后台 %llu 次共 %.1f ms），表满没收 %llu 条，回收没用上的 %llu 条，表里现有 %d 条",
              (unsigned long long)g_sub_serial, (unsigned long long)g_pp_scans, g_pp_scan_ns / 1e6 / (double)g_pp_scans,
              (unsigned long long)g_pp_stop[0], (unsigned long long)g_pp_stop[1], (unsigned long long)g_pp_stop[2],
-             (unsigned long long)g_pp_kicked, (unsigned long long)g_pp_taken, (unsigned long long)waits, wait_ns / 1e6,
+             (unsigned long long)g_pp_kicked, (unsigned long long)g_pp_desc_off, (unsigned long long)g_pp_taken, (unsigned long long)waits, wait_ns / 1e6,
              (unsigned long long)full, (unsigned long long)freed, busy);
     }
 }
@@ -7778,6 +7795,14 @@ void dm_nvn_probe_prediction(void) {
     if (!pred_guess_wanted(1, d32, 0, color_fs) || !pred_guess_wanted(2, ds8, ds8, color_fs) || pred_guess_wanted(3, d32, 0, color_fs)
         || pred_guess_wanted(2, d32, 0, color_fs))
         MDIE("pipeline prediction attach-mode guesses changed");
+    // A plain guess's descriptor (and the varying-patched or depth-less libraries it needs) is made on the worker; a key
+    // whose descriptor reads the replay state (vertex border colours: the bound samplers) or a merged pass is not.
+    { pso_key plain; memset(&plain, 0, sizeof plain); pso_key border = plain, layered = plain, mfx = plain, merged = plain;
+      border.a2c = PSO_VBORDER; layered.a2c = PSO_LAYERED; mfx.a2c = 1u << 2; merged.fsfn = (const void *)&plain;
+      plain.a2c = 1;   // alpha to coverage is part of the descriptor, not of the replay state
+      if (!pso_desc_off_thread(&plain) || pso_desc_off_thread(&border) || pso_desc_off_thread(&layered)
+          || pso_desc_off_thread(&mfx) || pso_desc_off_thread(&merged))
+          MDIE("pipeline prediction made a guess's descriptor on the submission thread"); }
 
     // Reclaim completed stale guesses, but retain recent completions and even
     // very old unfinished jobs (their workers can still publish into the slot).

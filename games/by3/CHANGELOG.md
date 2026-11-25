@@ -381,3 +381,14 @@ Same scripted deck run (`DM_EXP_CLEAR_SER=41`, then holding W and turning the ca
   pre-pass and the colour-pass vertex shaders read for one object, and compare the matrices (the previous-frame camera
   for motion vectors is the first suspect: a binding or offset mixed up between the two programs).
 - The cached MSL of `cd871b70` (stencil gathered as `texture2d<uint>`) is still the hand-edited one on this machine.
+
+### 2026-11-25: pipeline guesses get their descriptors on the worker
+
+The graphics layer's pipeline prediction (same change as `games/totk`, `docs/pipeline-prediction-stalls.md`): a plain
+guessed pipeline's descriptor, with the varying-patched vertex library and the depth-less fragment library it may
+need, is now made on the background worker instead of the submission thread (`pso_desc_off_thread`). Keys that read
+replay state (emulated vertex border colours) stay where they were. Not built or measured on a Mac yet.
+
+Still open for shader stutter here: a shared shader list and a build-time seed. TotK's seed finds its shaders in the
+RomFS by container format (BNSH, `.sharcb`); Bayonetta's live in `shader2.dat` inside the `.pkz` archives, a format
+this folder does not read yet, so its build cannot find the shaders to translate ahead of play.
