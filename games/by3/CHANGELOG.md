@@ -381,3 +381,17 @@ Same scripted deck run (`DM_EXP_CLEAR_SER=41`, then holding W and turning the ca
   pre-pass and the colour-pass vertex shaders read for one object, and compare the matrices (the previous-frame camera
   for motion vectors is the first suspect: a binding or offset mixed up between the two programs).
 - The cached MSL of `cd871b70` (stencil gathered as `texture2d<uint>`) is still the hand-edited one on this machine.
+
+### 2026-11-25: a probe that compares the two passes' uniform bytes (not yet run)
+
+- `DM_EXP_CAMCMP=41` (measurement only; `DM_EXP_CAMCMP_FRAMES`, default 8): for each frame, every vertex-stage
+  uniform binding of the depth pre-pass (depth write on, no colour written) and of the colour pass into ser 41 is
+  hashed as the GPU reads it (the submit-time snapshot, a renamed inline update, or memory), and one `[camcmp]` report
+  per frame says (a) which guest ranges both passes bind with different bytes and (b) for the draws found in both
+  passes (same index buffer, counts, vertex buffers), which slots differ, with the first differing 16-byte rows as
+  floats. Argument-buffer reuse is off while it runs. A frame where the two passes agree says so in one line.
+- Expected readings: rows that differ by a camera step only while the camera moves = one pass reads another frame's
+  camera (then the slot and source letter `m`/`c`/`l` say where the stale copy comes from). No differences at all =
+  the matrices are not the cause, and the next suspects are the vertex streams or the shaders' own arithmetic.
+- The bookkeeping was checked off the Mac (the C part, with stubs, under ASan/UBSan); the Objective-C build has not
+  been compiled here.
