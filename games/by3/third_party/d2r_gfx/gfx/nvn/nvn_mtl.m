@@ -7037,6 +7037,145 @@ static const uint8_t *bound_uniform_bytes(uint64_t gpu, size_t size, id<MTLBuffe
     }
     return NULL; // e.g. the special UI motion matrix ring: do not label live bytes as bound bytes
 }
+/* Bayonetta 3 (2026-11-25), measurement only. DM_EXP_CAMCMP=<colour target serial> (41 = the colour pass of the deck):
+   compares, per frame, the vertex-stage uniform bytes that the depth pre-pass and the colour pass into that serial
+   actually bind (the copy the GPU reads: snapshot, renamed inline update or memory). The colour pass fails LEQUAL
+   against the pre-pass depth only while the camera moves (CHANGELOG 2026-10-19), so the first suspect is one pass
+   reading another frame's camera: this names the uniform buffer, the slot and the 16-byte rows that differ.
+   Two checks: (a) the same guest range bound in both passes with different bytes; (b) the same draw (index buffer,
+   counts, vertex buffers) in both passes, slot by slot. One "[camcmp]" report per frame with draws in that serial, for
+   DM_EXP_CAMCMP_FRAMES frames (default 8); a frame where both passes agree says so in one line. Turns argument-buffer
+   reuse off (like the pass dump) so every draw's bindings are seen. */
+#define CC_ROWS 4096u   /* bytes kept per distinct uniform content */
+typedef struct { uint64_t addr, size, h, gpu; int reg; char src; } cc_bind;
+typedef struct { uint64_t key, pass; uint32_t b0, nb; int pre; char vs[17]; } cc_draw;
+typedef struct { uint64_t h; uint32_t off, len; } cc_blob;
+static long g_cc_ser = -2, g_cc_frames_left; static uint64_t g_cc_frame = UINT64_MAX;
+static cc_bind *g_cc_b; static uint32_t g_cc_nb, g_cc_capb;
+static cc_draw *g_cc_d; static uint32_t g_cc_nd, g_cc_capd;
+static cc_blob *g_cc_bl; static uint32_t g_cc_nbl, g_cc_capbl; static uint8_t *g_cc_bytes; static uint64_t g_cc_nbytes, g_cc_capbytes;
+static cc_bind g_cc_cur[16]; static uint16_t g_cc_curmask;   /* the stage-0 bindings of the draw being encoded */
+static int camcmp_on(void) {
+    if (g_cc_ser == -2) { const char *e = getenv("DM_EXP_CAMCMP"); g_cc_ser = e ? strtol(e, NULL, 0) : -1;
+        const char *f = getenv("DM_EXP_CAMCMP_FRAMES"); g_cc_frames_left = f ? atol(f) : 8;
+        if (g_cc_ser >= 0) MLOG("[camcmp] 比对深度预通道与颜色通道 ser %ld 的顶点 uniform（%ld 帧，只作测量）", g_cc_ser, g_cc_frames_left); }
+    return g_cc_ser >= 0 && g_cc_frames_left > 0;
+}
+static uint64_t cc_fnv(const uint8_t *p, size_t n) { uint64_t h = 0xcbf29ce484222325ull; for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x100000001b3ull; } return h ^ n; }
+static const cc_blob *cc_blob_find(uint64_t h) { for (uint32_t i = 0; i < g_cc_nbl; i++) if (g_cc_bl[i].h == h) return &g_cc_bl[i]; return NULL; }
+static void cc_blob_add(uint64_t h, const uint8_t *p, size_t n) {
+    if (n > CC_ROWS) n = CC_ROWS;
+    if (g_cc_nbl > 20000 || g_cc_nbytes + n > (64u << 20)) return;   /* enough to name the buffer; rows of later ones are not kept */
+    for (uint32_t i = g_cc_nbl; i-- > 0 && i + 64 >= g_cc_nbl;) if (g_cc_bl[i].h == h) return;   /* recent duplicates (the common case) */
+    if (g_cc_nbl == g_cc_capbl) { g_cc_capbl = g_cc_capbl ? g_cc_capbl * 2 : 1024; g_cc_bl = realloc(g_cc_bl, g_cc_capbl * sizeof *g_cc_bl); if (!g_cc_bl) MDIE("camcmp"); }
+    if (g_cc_nbytes + n > g_cc_capbytes) { g_cc_capbytes = g_cc_capbytes ? g_cc_capbytes * 2 : (1u << 20); while (g_cc_capbytes < g_cc_nbytes + n) g_cc_capbytes *= 2; g_cc_bytes = realloc(g_cc_bytes, g_cc_capbytes); if (!g_cc_bytes) MDIE("camcmp"); }
+    memcpy(g_cc_bytes + g_cc_nbytes, p, n); g_cc_bl[g_cc_nbl++] = (cc_blob){h, (uint32_t)g_cc_nbytes, (uint32_t)n}; g_cc_nbytes += n;
+}
+static void camcmp_report(void);
+static void cc_frame_tick(void) {   /* a new frame: report the last one before anything of this one is kept */
+    uint64_t f = atomic_load(&g_cur_frame);
+    if (f != g_cc_frame) { if (g_cc_frame != UINT64_MAX) camcmp_report(); g_cc_frame = f; }
+}
+/* encode_args, vertex stage, per uniform binding: what this draw's shader will read. */
+static void camcmp_note_cbuf(int reg, const p_bind_buf *u, uint64_t gpu, id<MTLBuffer> mb, uint64_t mo) {
+    if (reg < 0 || reg >= 16 || !u->size) return;
+    cc_frame_tick();
+    const uint8_t *p = bound_uniform_bytes(gpu, (size_t)u->size, mb);
+    char src = p == (const uint8_t *)(uintptr_t)u->addr ? 'm' : 'c';   /* guest memory itself / a copy (snapshot or renamed inline update) */
+    (void)mo;
+    if (!p) { p = (const uint8_t *)(uintptr_t)u->addr; src = 'l'; }   /* live guest bytes (e.g. the UI matrix ring) */
+    size_t n = (size_t)u->size;
+    uint64_t h = cc_fnv(p, n < 65536 ? n : 65536);
+    cc_blob_add(h, p, n);
+    g_cc_cur[reg] = (cc_bind){u->addr, u->size, h, gpu, reg, src}; g_cc_curmask |= (uint16_t)(1u << reg);
+}
+static int cc_cmp_key(const void *x, const void *y) { const cc_draw *a = x, *b = y; return a->key < b->key ? -1 : a->key > b->key ? 1 : a->pre - b->pre; }
+static int cc_cmp_addr(const void *x, const void *y) { const cc_bind *a = *(cc_bind *const *)x, *b = *(cc_bind *const *)y; return a->addr < b->addr ? -1 : a->addr > b->addr ? 1 : a->size < b->size ? -1 : a->size > b->size; }
+static void cc_rows(const char *what, const cc_bind *a, const cc_bind *b) {   /* the first differing 16-byte rows, as floats */
+    const cc_blob *x = cc_blob_find(a->h), *y = cc_blob_find(b->h);
+    if (!x || !y) { MLOG("[camcmp]   %s: 内容未留存（超出留存上限）", what); return; }
+    uint32_t n = x->len < y->len ? x->len : y->len; int shown = 0, diff = 0;
+    for (uint32_t r = 0; r + 16 <= n; r += 16) {
+        if (!memcmp(g_cc_bytes + x->off + r, g_cc_bytes + y->off + r, 16)) continue;
+        diff++; if (shown >= 6) continue; shown++;
+        const float *f = (const float *)(g_cc_bytes + x->off + r), *g = (const float *)(g_cc_bytes + y->off + r);
+        MLOG("[camcmp]   %s +%#x 预通道 %g %g %g %g | 颜色通道 %g %g %g %g", what, r, f[0], f[1], f[2], f[3], g[0], g[1], g[2], g[3]);
+    }
+    MLOG("[camcmp]   %s：共 %d 行（16 字节）不同，比较了前 %u 字节", what, diff, n);
+}
+static void camcmp_report(void) {
+    uint32_t npre = 0, ncol = 0; for (uint32_t i = 0; i < g_cc_nd; i++) { if (g_cc_d[i].pre) npre++; else ncol++; }
+    if (!ncol) goto reset;
+    g_cc_frames_left--;
+    MLOG("[camcmp] F%llu 预通道绘制 %u，颜色通道 ser %ld 绘制 %u，不同 uniform 内容 %u 份", (unsigned long long)g_cc_frame, npre, g_cc_ser, ncol, g_cc_nbl);
+    {   /* (a) by guest range */
+        cc_bind **pre = malloc(sizeof *pre * (g_cc_nb + 1)), **col = malloc(sizeof *col * (g_cc_nb + 1)); uint32_t np = 0, nc = 0;
+        if (!pre || !col) MDIE("camcmp");
+        for (uint32_t i = 0; i < g_cc_nd; i++) for (uint32_t k = 0; k < g_cc_d[i].nb; k++) { cc_bind *b = &g_cc_b[g_cc_d[i].b0 + k]; if (g_cc_d[i].pre) pre[np++] = b; else col[nc++] = b; }
+        qsort(pre, np, sizeof *pre, cc_cmp_addr); qsort(col, nc, sizeof *col, cc_cmp_addr);
+        uint32_t i = 0, j = 0, both = 0, bad = 0, shown = 0;
+        while (i < np && j < nc) {
+            int c = cc_cmp_addr(&pre[i], &col[j]);
+            if (c < 0) { i++; continue; } if (c > 0) { j++; continue; }
+            uint64_t a = pre[i]->addr, s = pre[i]->size; uint32_t i1 = i, j1 = j;
+            while (i1 < np && pre[i1]->addr == a && pre[i1]->size == s) i1++;
+            while (j1 < nc && col[j1]->addr == a && col[j1]->size == s) j1++;
+            both++;
+            /* a range can legitimately change inside the pass (inline updates): different only if no colour-pass content equals the pre-pass's last one */
+            const cc_bind *lp = pre[i1 - 1]; int same = 0; for (uint32_t q = j; q < j1; q++) if (col[q]->h == lp->h) same = 1;
+            if (!same) { bad++;
+                if (shown++ < 6) { char w[96]; snprintf(w, sizeof w, "地址 %#llx 大小 %llu（预通道 cb%d/%c，颜色通道 cb%d/%c）", (unsigned long long)a, (unsigned long long)s, lp->reg, lp->src, col[j]->reg, col[j]->src);
+                    MLOG("[camcmp] (a) 同一 uniform 两通道内容不同：%s", w); cc_rows(w, lp, col[j]); } }
+            i = i1; j = j1;
+        }
+        MLOG("[camcmp] (a) 两通道都绑的 uniform 区间 %u 个，内容不同 %u 个", both, bad);
+        free(pre); free(col);
+    }
+    {   /* (b) by draw */
+        qsort(g_cc_d, g_cc_nd, sizeof *g_cc_d, cc_cmp_key);
+        uint32_t matched = 0, equal = 0, shown = 0; uint32_t slot_bad[16] = {0}, slot_moved[16] = {0};
+        for (uint32_t i = 0; i < g_cc_nd;) {
+            uint32_t i1 = i; while (i1 < g_cc_nd && g_cc_d[i1].key == g_cc_d[i].key) i1++;
+            const cc_draw *p = NULL, *c = NULL;   /* the last pre-pass draw and the first colour draw of this key */
+            for (uint32_t q = i; q < i1; q++) { if (g_cc_d[q].pre) p = &g_cc_d[q]; else if (!c) c = &g_cc_d[q]; }
+            if (p && c) { matched++; int ok = 1;
+                for (uint32_t k = 0; k < c->nb; k++) { const cc_bind *cb = &g_cc_b[c->b0 + k], *pb = NULL;
+                    for (uint32_t m = 0; m < p->nb; m++) if (g_cc_b[p->b0 + m].reg == cb->reg) pb = &g_cc_b[p->b0 + m];
+                    if (!pb) continue;
+                    if (pb->h != cb->h) { ok = 0; if (pb->addr != cb->addr || pb->size != cb->size) slot_moved[cb->reg]++; else slot_bad[cb->reg]++;
+                        if (shown++ < 4) { char w[160]; snprintf(w, sizeof w, "绘制 %016llx cb%d 预通道 vs %s @%#llx+%llu/%c，颜色通道 vs %s @%#llx+%llu/%c", (unsigned long long)c->key, cb->reg,
+                                 p->vs, (unsigned long long)pb->addr, (unsigned long long)pb->size, pb->src, c->vs, (unsigned long long)cb->addr, (unsigned long long)cb->size, cb->src);
+                            MLOG("[camcmp] (b) %s", w); cc_rows(w, pb, cb); } } }
+                equal += ok; }
+            i = i1;
+        }
+        char sl[256]; int o = 0; for (int r = 0; r < 16; r++) if (slot_bad[r] || slot_moved[r]) o += snprintf(sl + o, sizeof sl - (size_t)o, " cb%d:%u同址/%u异址", r, slot_bad[r], slot_moved[r]);
+        sl[o] = 0;
+        MLOG("[camcmp] (b) 两通道都画的绘制 %u 个，顶点 uniform 全同 %u 个；不同的槽：%s", matched, equal, o ? sl : " 无");
+    }
+reset:
+    g_cc_nb = g_cc_nd = g_cc_nbl = 0; g_cc_nbytes = 0;
+    if (!g_cc_frames_left) MLOG("[camcmp] 测完，之后不再比对");
+}
+/* draw_inner, after the arguments are encoded: file this draw under the pre-pass or the colour pass. */
+static void camcmp_draw(const p_draw *dw, const p_draw_idx *di, NvShader *vs) {
+    cc_frame_tick();
+    uint16_t mask = g_cc_curmask; g_cc_curmask = 0;
+    if (!camcmp_on()) return;
+    int col = R.rt.n > 0 && R.rt.color[0] && (long)R.rt.color[0]->serial == g_cc_ser;
+    int pre = !col && R.rt.depth && S.ds.dw && (R.rt.n == 0 || S.chmask.mask == 0);
+    if ((!col && !pre) || (!dw && !di)) return;
+    uint64_t k[8] = { dw ? 1 : 2, dw ? (uint64_t)(uint32_t)dw->first : di->ibuf, dw ? (uint64_t)dw->count : (uint64_t)di->count,
+                      dw ? (uint64_t)dw->instances : ((uint64_t)(uint32_t)di->base_vertex << 32 | (uint32_t)di->instances),
+                      S.vbuf[0].address, S.vbuf[1].address, S.vbuf[2].address, S.vbuf[3].address };
+    if (g_cc_nd == g_cc_capd) { g_cc_capd = g_cc_capd ? g_cc_capd * 2 : 4096; g_cc_d = realloc(g_cc_d, g_cc_capd * sizeof *g_cc_d); if (!g_cc_d) MDIE("camcmp"); }
+    cc_draw *d = &g_cc_d[g_cc_nd++]; d->key = cc_fnv((const uint8_t *)k, sizeof k); d->pass = g_stat_pass; d->pre = pre; d->b0 = g_cc_nb; d->nb = 0;
+    snprintf(d->vs, sizeof d->vs, "%.16s", vs && vs->key[0] ? vs->key : "?");
+    for (int r = 0; r < 16; r++) if (mask >> r & 1) {
+        if (g_cc_nb == g_cc_capb) { g_cc_capb = g_cc_capb ? g_cc_capb * 2 : 16384; g_cc_b = realloc(g_cc_b, g_cc_capb * sizeof *g_cc_b); if (!g_cc_b) MDIE("camcmp"); }
+        g_cc_b[g_cc_nb++] = g_cc_cur[r]; d->nb++;
+    }
+}
 static int arg_epoch_safe(NvShader *sh) {
     if (!sh->ab_epoch_ok) {
         sh->ab_epoch_ok = 1;
@@ -7078,7 +7217,8 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         epoch_hit = sh->ab_buf && !memcmp(&epoch, &sh->ab_epoch, sizeof epoch);
         registry_unlock();
     }
-    int reuse = !ab_noreuse && !passdump() && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
+    if (nvn_stage == 0 && g_cc_ser != -1) camcmp_on();
+    int reuse = !ab_noreuse && !passdump() && !(g_cc_ser >= 0 && g_cc_frames_left > 0) && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
         (epoch_mode ? epoch_hit : !g_args_dirty[nvn_stage]);
     int verify_epoch = reuse && epoch_mode && atomic_load_explicit(&g_arg_epoch_check, memory_order_relaxed);
     if (reuse) {
@@ -7131,6 +7271,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             if (ren) { gpu = ren; if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) RED_ONCE(58, "UI 矩阵修补读的是内存，跳过了含内联更新的 uniform 副本"); }
             else if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
             else { const usnap_t *sc = usnap_find(u->addr, u->size ? u->size : 1); if (sc) gpu = sc->gpu + (u->addr - sc->lo); }   // TOTK: contents as of the submit call
+            if (nvn_stage == 0 && g_cc_ser >= 0 && camcmp_on()) camcmp_note_cbuf(reg, u, gpu, (__bridge id<MTLBuffer>)mb, mo);   // DM_EXP_CAMCMP (measurement)
             if (bl) {
                 PD("B %llu st%d cb reg%d addr=%#llx size=%llu pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size,
                    (unsigned long long)(u->addr - mo), (unsigned long long)mo, ((float *)u->addr)[0], ((float *)u->addr)[1], ((float *)u->addr)[2], ((float *)u->addr)[3]);
@@ -10005,6 +10146,7 @@ frz_plain:;
     if (g_lay.active) enc_r_vbuf(en, LAY_BUF_INDEX, lay_gpu(g_lay_probe_neg == 1 ? 0 : g_lay.cur - g_lay.base));   // TOTK: this draw's layer within the layered pass
     if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
+    if (g_cc_ser != -1) camcmp_draw(dw, di, pr->sh[0]);   // DM_EXP_CAMCMP (measurement)
     // 参数绑定在登记表锁内捕获实际资源；资格判断到绑定期间有版本变化，则在任何GPU draw前切开重试。
     // Parameter binding captures the actual resources under the registry lock; if the version changed between the eligibility check and the binding, split and retry before any GPU draw.
     if (g_rt_range_active && (g_pass.reg_gen != g_reg_gen || g_pass.ser_gen != g_ser_gen || g_pass.range_dirty != nvn_dirty_now())) { rp_end(); draw(dw, di); return; }
